@@ -85,6 +85,17 @@ describe("getEditorSettings", () => {
 		const snap = getEditorSettings(doc);
 		expect(snap.showBlur).toBe(false);
 	});
+
+	it("keeps depth of field on unless the project stored a boolean off", () => {
+		expect(getEditorSettings(baseDoc).depthOfField).toBe(true);
+		const junk: AxcutDocument = {
+			...baseDoc,
+			legacyEditor: { depthOfField: "no" as unknown as boolean },
+		};
+		expect(getEditorSettings(junk).depthOfField).toBe(true);
+		const off = patchEditorSettings(baseDoc, { depthOfField: false });
+		expect(getEditorSettings(off).depthOfField).toBe(false);
+	});
 });
 
 describe("patchEditorSettings", () => {
@@ -119,6 +130,14 @@ describe("patchEditorSettings", () => {
 		const snap = getEditorSettings(next);
 		expect(snap.cursor.size).toBe(4);
 		expect(snap.cursor.smoothing).toBe(0.9);
+	});
+
+	it("switches the 3D cursor without clobbering its siblings, off by default", () => {
+		expect(getEditorSettings(baseDoc).cursor.model3d).toBe(false);
+		const seed = patchEditorSettings(baseDoc, { cursor: { size: 4 } });
+		const on = getEditorSettings(patchEditorSettings(seed, { cursor: { model3d: true } }));
+		expect(on.cursor.model3d).toBe(true);
+		expect(on.cursor.size).toBe(4);
 	});
 
 	it("toggles cursorAutoHide on and off via patch", () => {
@@ -277,6 +296,49 @@ describe("patchEditorSettings", () => {
 			legacyEditor: { webcamBackgroundMode: "hologram" },
 		} as typeof baseDoc;
 		expect(getEditorSettings(doc).webcamBackgroundMode).toBe("none");
+	});
+
+	it("round-trips the wallpaper motion and rejects an unknown one", () => {
+		expect(getEditorSettings(baseDoc).wallpaperMotion).toBe("none");
+		const patched = patchEditorSettings(baseDoc, { wallpaperMotion: "aurora" });
+		expect(getEditorSettings(patched).wallpaperMotion).toBe("aurora");
+		const doc = { ...baseDoc, legacyEditor: { wallpaperMotion: "plasma" } } as typeof baseDoc;
+		expect(getEditorSettings(doc).wallpaperMotion).toBe("none");
+	});
+
+	it("round-trips the recording frame and reads an unknown one as no frame", () => {
+		expect(getEditorSettings(baseDoc).frame).toBe("none");
+		for (const frame of ["window", "laptop", "phone", "monitor"] as const) {
+			const patched = patchEditorSettings(baseDoc, { frame });
+			expect(getEditorSettings(patched).frame).toBe(frame);
+		}
+		const unknown = { ...baseDoc, legacyEditor: { frame: "holo-visor" } } as typeof baseDoc;
+		expect(getEditorSettings(unknown).frame).toBe("none");
+	});
+
+	// The migration: the theme used to be baked into the frame, and a project written then must
+	// open with BOTH the frame and the theme it had — without the document being rewritten.
+	it("splits the old window-light / window-dark into a frame and a theme", () => {
+		expect(getEditorSettings(baseDoc).frameTheme).toBe("light");
+		for (const [stored, theme] of [
+			["window-light", "light"],
+			["window-dark", "dark"],
+		] as const) {
+			const doc = { ...baseDoc, legacyEditor: { frame: stored } } as typeof baseDoc;
+			expect(getEditorSettings(doc).frame).toBe("window");
+			expect(getEditorSettings(doc).frameTheme).toBe(theme);
+		}
+		// And the theme is its own setting from here on, for every frame.
+		for (const frameTheme of ["light", "dark"] as const) {
+			const patched = patchEditorSettings(baseDoc, { frame: "laptop", frameTheme });
+			expect(getEditorSettings(patched).frameTheme).toBe(frameTheme);
+		}
+		// An explicit theme wins over the one an old value implies.
+		const both = {
+			...baseDoc,
+			legacyEditor: { frame: "window-light", frameTheme: "dark" },
+		} as typeof baseDoc;
+		expect(getEditorSettings(both).frameTheme).toBe("dark");
 	});
 
 	it("clamps a stored webcam blur intensity into 0..1", () => {

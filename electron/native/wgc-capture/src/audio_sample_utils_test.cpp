@@ -1351,6 +1351,190 @@ int main() {
         runMixer(true, "-with-mic");
     }
 
+    // --- Gain staging: where the microphone gain clamps ----------------------
+    //
+    // The microphone used to be boosted at push time, clamping to the rails in
+    // PCM16 before the system stream was mixed in -- a hot boosted mic arrived
+    // flat-topped and the sum then distorted again on top of it. The gain now
+    // rides in the double-domain sum and the result clamps exactly once, at the
+    // write. DC levels make every post-fill output sample an exact number, so
+    // the three cases below pin the arithmetic itself rather than a tendency.
+    //
+    // float32 in, PCM16 out, both 48 kHz -- the interpolation branch, which is
+    // what an ordinary machine's microphone packet takes.
+    {
+        const AudioInputFormat f32stereo = makeFormat(MFAudioFormat_Float, 48000, 2, 32);
+        const auto dcPacket = [&](double value, size_t frames) {
+            std::vector<BYTE> bytes(frames * f32stereo.blockAlign, 0);
+            auto* samples = reinterpret_cast<float*>(bytes.data());
+            for (size_t i = 0; i < frames; i += 1) {
+                samples[i * 2] = static_cast<float>(value);
+                samples[i * 2 + 1] = static_cast<float>(value);
+            }
+            return bytes;
+        };
+        const auto steadySample = [&](bool includeSystem, double system, double mic,
+                                      double gain) -> int {
+            std::mutex guard;
+            std::vector<BYTE> collected;
+            AudioMixer mixer(
+                target48k, f32stereo, f32stereo, includeSystem, true, gain,
+                [&](const BYTE* data, DWORD byteCount, int64_t, int64_t) {
+                    std::scoped_lock lock(guard);
+                    collected.insert(collected.end(), data, data + byteCount);
+                    return true;
+                });
+            expect("gain-stage-mixer-start", mixer.start(), "");
+            mixer.beginTimeline();
+            // Far more than the 10 ms cadence can consume in the wait window, so
+            // no pop() ever zero-fills into the measured region.
+            const auto systemPackets = dcPacket(system, 48000);
+            const auto micPackets = dcPacket(mic, 48000);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            for (int burst = 0; burst < 20; burst += 1) {
+                if (includeSystem) {
+                    mixer.pushSystem(systemPackets.data(), static_cast<DWORD>(systemPackets.size()));
+                }
+                mixer.pushMicrophone(micPackets.data(), static_cast<DWORD>(micPackets.size()));
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                std::scoped_lock lock(guard);
+                // 2 s of output is well past queue fill-in; DC never varies after.
+                if (collected.size() >= 2 * 48000 * target48k.blockAlign) {
+                    break;
+                }
+                if (std::chrono::steady_clock::now() > deadline) {
+                    break;
+                }
+            }
+            mixer.stop();
+            const size_t frames = collected.size() / target48k.blockAlign;
+            // The bursts span ~0.65 s of real time and mixLoop emits on the
+            // clock, so that is what there is; 0.5 s is far past queue fill-in
+            // and DC never varies after it.
+            expect("gain-stage-produced-output", frames >= 24000, "frames=" + std::to_string(frames));
+            // The last written sample: every one of them is the same number once
+            // both queues have delivered, which is what DC buys us.
+            const auto* out = reinterpret_cast<const int16_t*>(collected.data());
+            return out[(frames - 1) * 2];
+        };
+
+        // (1) 0.9 * 1.4 - 0.5 = 0.76 -> 24903. The old clamp-then-sum path read
+        // 0.5 (16384) here because the boosted mic was already flat at 1.0.
+        {
+            const int got = steadySample(true, -0.5, 0.9, 1.4);
+            char detail[96]{};
+            sprintf_s(detail, "got=%d want=24903", got);
+            std::cout << "GAIN_RAW mix-over-system " << detail << std::endl;
+            expect("mixer-mic-gain-applied-at-mix", std::abs(got - 24903) <= 2, detail);
+        }
+        // (2) 0.9 * 1.4 + 0.5 = 1.76 -> clamped once at the rail.
+        {
+            const int got = steadySample(true, 0.5, 0.9, 1.4);
+            char detail[96]{};
+            sprintf_s(detail, "got=%d want=32767", got);
+            std::cout << "GAIN_RAW sum-clamp " << detail << std::endl;
+            expect("mixer-sum-clamps-once-at-rail", got >= 32766, detail);
+        }
+        // (3) Unity passthrough: the level a mic-only take must ride at, since
+        // the request now sends 1.0 when there is no system audio to sit over.
+        {
+            const int got = steadySample(false, 0.0, 0.9, 1.0);
+            char detail[96]{};
+            sprintf_s(detail, "got=%d want=29490", got);
+            std::cout << "GAIN_RAW unity " << detail << std::endl;
+            expect("mixer-unity-gain-passthrough", std::abs(got - 29490) <= 2, detail);
+        }
+    }
+
+    // --- mixAudioInPlace, per output format -----------------------------------
+    //
+    // The gain rides in mixAudioInPlace on every format branch, but the
+    // AudioMixer sections above can only reach PCM16: production always mixes
+    // into the AAC input format. These call the branches directly, with the
+    // negative-destination-plus-boosted-source case that pins sum-then-clamp
+    // (clamp-then-sum reads the destination alone: 0.4, not 0.76).
+    {
+        const size_t frames = 4;
+        const AudioInputFormat f32 = makeFormat(MFAudioFormat_Float, 48000, 2, 32);
+        {
+            std::vector<BYTE> dest(frames * f32.blockAlign, 0);
+            std::vector<BYTE> src(frames * f32.blockAlign, 0);
+            auto* d = reinterpret_cast<float*>(dest.data());
+            auto* s = reinterpret_cast<float*>(src.data());
+            for (size_t i = 0; i < frames * 2; i += 1) {
+                d[i] = -0.5f;
+                s[i] = 0.9f;
+            }
+            mixAudioInPlace(dest, src.data(), static_cast<DWORD>(src.size()), f32, 1.4);
+            char detail[96]{};
+            sprintf_s(detail, "got=%.6f want=0.76", d[0]);
+            std::cout << "MIXFMT_RAW float-over-system " << detail << std::endl;
+            expect("mix-in-place-float-sums-before-clamp", std::abs(d[0] - 0.76) < 1e-3, detail);
+            for (size_t i = 0; i < frames * 2; i += 1) {
+                d[i] = 0.5f;
+            }
+            mixAudioInPlace(dest, src.data(), static_cast<DWORD>(src.size()), f32, 1.4);
+            sprintf_s(detail, "got=%.6f want=1.0", d[0]);
+            std::cout << "MIXFMT_RAW float-rail " << detail << std::endl;
+            expect("mix-in-place-float-clamps-at-rail", d[0] == 1.0f, detail);
+        }
+        // PCM16 is the production path, pinned here in its own units too:
+        // -16384 + 29491 * 1.4 = 24903.4 -> 24903, and 16384 + 29491 * 1.4
+        // clamps at 32767.
+        {
+            std::vector<BYTE> dest(frames * target48k.blockAlign, 0);
+            std::vector<BYTE> src(frames * target48k.blockAlign, 0);
+            auto* d = reinterpret_cast<int16_t*>(dest.data());
+            auto* s = reinterpret_cast<int16_t*>(src.data());
+            for (size_t i = 0; i < frames * 2; i += 1) {
+                d[i] = -16384;
+                s[i] = 29491;
+            }
+            mixAudioInPlace(
+                dest, src.data(), static_cast<DWORD>(src.size()), target48k, 1.4);
+            char detail[96]{};
+            sprintf_s(detail, "got=%d want=24903", d[0]);
+            std::cout << "MIXFMT_RAW pcm16-over-system " << detail << std::endl;
+            expect("mix-in-place-pcm16-sums-before-clamp", std::abs(d[0] - 24903) <= 1, detail);
+            for (size_t i = 0; i < frames * 2; i += 1) {
+                d[i] = 16384;
+            }
+            mixAudioInPlace(
+                dest, src.data(), static_cast<DWORD>(src.size()), target48k, 1.4);
+            sprintf_s(detail, "got=%d want=32767", d[0]);
+            std::cout << "MIXFMT_RAW pcm16-rail " << detail << std::endl;
+            expect("mix-in-place-pcm16-clamps-at-rail", d[0] == 32767, detail);
+        }
+        // Round numbers in int32 units: -1e9 + 2e9 * 1.4 = 1.8e9 (fits), and
+        // 1e9 + 2e9 * 1.4 = 3.8e9 clamps at INT32_MAX.
+        {
+            const AudioInputFormat p32 = makeFormat(MFAudioFormat_PCM, 48000, 2, 32);
+            std::vector<BYTE> dest(frames * p32.blockAlign, 0);
+            std::vector<BYTE> src(frames * p32.blockAlign, 0);
+            auto* d = reinterpret_cast<int32_t*>(dest.data());
+            auto* s = reinterpret_cast<int32_t*>(src.data());
+            for (size_t i = 0; i < frames * 2; i += 1) {
+                d[i] = -1000000000;
+                s[i] = 2000000000;
+            }
+            mixAudioInPlace(dest, src.data(), static_cast<DWORD>(src.size()), p32, 1.4);
+            char detail[96]{};
+            sprintf_s(detail, "got=%d want=1800000000", static_cast<int>(d[0]));
+            std::cout << "MIXFMT_RAW pcm32-over-system " << detail << std::endl;
+            expect("mix-in-place-pcm32-sums-before-clamp", d[0] == 1800000000LL, detail);
+            for (size_t i = 0; i < frames * 2; i += 1) {
+                d[i] = 1000000000;
+            }
+            mixAudioInPlace(dest, src.data(), static_cast<DWORD>(src.size()), p32, 1.4);
+            sprintf_s(detail, "got=%d want=2147483647", static_cast<int>(d[0]));
+            std::cout << "MIXFMT_RAW pcm32-rail " << detail << std::endl;
+            expect(
+                "mix-in-place-pcm32-clamps-at-rail",
+                d[0] == static_cast<int32_t>(2147483647LL),
+                detail);
+        }
+    }
+
     HRESULT mfHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(mfHr) && mfHr != RPC_E_CHANGED_MODE) {
         skip("mf-startup", "CoInitializeEx failed — no Media Foundation on this host");

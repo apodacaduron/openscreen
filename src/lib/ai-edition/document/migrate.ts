@@ -194,6 +194,7 @@ export function migrateProjectDataToAxcutDocument(
 			...(typeof region.customScale === "number" ? { customScale: region.customScale } : {}),
 			...(region.source === "auto" || region.source === "manual" ? { source: region.source } : {}),
 			...(region.hideCursor ? { hideCursor: true } : {}),
+			...(region.clickImpact === true ? { clickImpact: true as const } : {}),
 		}));
 
 	const migratedAnnotations: AxcutAnnotationRegion[] = annotationRegions
@@ -286,9 +287,11 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 
 	const editor: ProjectEditorState = {
 		wallpaper: "",
+		wallpaperMotion: "none",
 		shadowIntensity: 0,
 		showBlur: false,
 		motionBlurAmount: 0,
+		depthOfField: true,
 		borderRadius: 0,
 		padding: 50,
 		cropRegion: { x: 0, y: 0, width: 1, height: 1 } as CropRegion,
@@ -330,6 +333,7 @@ export function migrateAxcutDocumentToProjectData(input: AxcutDocument): EditorP
 		...(typeof region.customScale === "number" ? { customScale: region.customScale } : {}),
 		...(region.source ? { source: region.source } : {}),
 		...(region.hideCursor ? { hideCursor: true } : {}),
+		...(region.clickImpact ? { clickImpact: true as const } : {}),
 	}));
 	editor.zoomRegions = reverseZoomRegions;
 
